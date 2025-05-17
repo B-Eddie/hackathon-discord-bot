@@ -2,11 +2,9 @@
     "1305714283912630432": {
         "spreadsheet_id": "1tiGw0cj1wHlYs1jkRbrcbbTmP9P8TfLFMi60HhQAbGA",
         "notification_channel_id": "1305714824235454564",
-        "hackathon_role_id": "1307874712621416507",
+        "hackathon_role_id": "1373100211550945300",
         "reminder_days": [
-            7,
-            3,
-            1
+            7
         ]
     }
 }

@@ -9,6 +9,11 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
 from typing import List
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('hackathon_bot')
 
 # Load environment variables
 load_dotenv()
@@ -137,55 +142,74 @@ def create_hackathon_embed(hackathon_data, title):
     embed.timestamp = datetime.now()
     return embed
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=1)  # Changed to 1 minute for testing, can change back to 30 later
 async def check_hackathons():
     """Regular check for hackathon updates and deadlines"""
     global previous_hackathons
+    logger.info("Running hackathon check...")
     
     for guild_id, guild_data in bot.guild_config.config.items():
-        if not all(key in guild_data for key in ['spreadsheet_id', 'notification_channel_id', 'hackathon_role_id']):
-            continue
-
-        channel = bot.get_channel(int(guild_data['notification_channel_id']))
-        if not channel:
-            continue
-
-        if guild_id not in previous_hackathons:
-            previous_hackathons[guild_id] = set()
-
-        tracker = HackathonTracker(guild_data['spreadsheet_id'])
-        hackathons = tracker.get_hackathons()
-        current_hackathons = set()
-        
-        for hackathon in hackathons:
-            if not hackathon or len(hackathon) < 1:
+        try:
+            if not all(key in guild_data for key in ['spreadsheet_id', 'notification_channel_id', 'hackathon_role_id']):
+                logger.warning(f"Guild {guild_id} missing required configuration")
                 continue
 
-            name = hackathon[0]
-            current_hackathons.add(name)
+            channel = bot.get_channel(int(guild_data['notification_channel_id']))
+            if not channel:
+                logger.warning(f"Could not find channel for guild {guild_id}")
+                continue
+
+            if guild_id not in previous_hackathons:
+                previous_hackathons[guild_id] = set()
+                logger.info(f"Initialized tracking for guild {guild_id}")
+
+            tracker = HackathonTracker(guild_data['spreadsheet_id'])
+            hackathons = tracker.get_hackathons()
+            current_hackathons = set()
             
-            # Check for new hackathons
-            if name not in previous_hackathons[guild_id]:
-                embed = create_hackathon_embed(hackathon, "New Hackathon Alert! 🎉")
-                await channel.send(
-                    f"<@&{guild_data['hackathon_role_id']}> A new hackathon has been added!",
-                    embed=embed
-                )
+            logger.info(f"Found {len(hackathons)} hackathons for guild {guild_id}")
+            
+            for hackathon in hackathons:
+                if not hackathon or len(hackathon) < 1:
+                    continue
 
-            # Check deadlines
-            if len(hackathon) >= 5 and hackathon[4]:
-                deadline = tracker.parse_date(hackathon[4])
-                if deadline:
-                    days_until = (deadline - datetime.now()).days
-                    reminder_days = guild_data.get('reminder_days', DEFAULT_REMINDER_DAYS)
-                    if days_until in reminder_days:
-                        embed = create_hackathon_embed(hackathon, f"⚠️ Deadline in {days_until} days!")
-                        await channel.send(
-                            f"<@&{guild_data['hackathon_role_id']}> Deadline reminder!",
-                            embed=embed
-                        )
+                name = hackathon[0]
+                current_hackathons.add(name)
+                
+                # Check for new hackathons
+                if name not in previous_hackathons[guild_id]:
+                    logger.info(f"New hackathon found in guild {guild_id}: {name}")
+                    embed = create_hackathon_embed(hackathon, "New Hackathon Alert! 🎉")
+                    await channel.send(
+                        f"<@&{guild_data['hackathon_role_id']}> A new hackathon has been added!",
+                        embed=embed
+                    )
 
-        previous_hackathons[guild_id] = current_hackathons
+                # Check deadlines
+                if len(hackathon) >= 5 and hackathon[4]:
+                    deadline = tracker.parse_date(hackathon[4])
+                    if deadline:
+                        days_until = (deadline - datetime.now()).days
+                        reminder_days = guild_data.get('reminder_days', DEFAULT_REMINDER_DAYS)
+                        if days_until in reminder_days:
+                            logger.info(f"Sending deadline reminder for {name} ({days_until} days)")
+                            embed = create_hackathon_embed(hackathon, f"⚠️ Deadline in {days_until} days!")
+                            await channel.send(
+                                f"<@&{guild_data['hackathon_role_id']}> Deadline reminder!",
+                                embed=embed
+                            )
+
+            # Update tracking set
+            logger.info(f"Updating tracking for guild {guild_id}. Previous: {len(previous_hackathons[guild_id])}, Current: {len(current_hackathons)}")
+            previous_hackathons[guild_id] = current_hackathons
+
+        except Exception as e:
+            logger.error(f"Error processing guild {guild_id}: {str(e)}", exc_info=True)
+
+@check_hackathons.before_loop
+async def before_check_hackathons():
+    await bot.wait_until_ready()
+    logger.info("Starting hackathon check loop...")
 
 @bot.tree.command(name="setup", description="Configure the hackathon bot for your server")
 @app_commands.describe(
@@ -310,8 +334,10 @@ async def list_hackathons(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    check_hackathons.start()
+    logger.info(f'{bot.user} has connected to Discord!')
+    if not check_hackathons.is_running():
+        check_hackathons.start()
+        logger.info("Hackathon check loop started")
 
 @bot.tree.command(name="change_spreadsheet", description="Change the Google Spreadsheet ID for hackathon tracking")
 @app_commands.describe(
@@ -373,6 +399,77 @@ async def view_config(interaction: discord.Interaction):
         inline=False
     )
     
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="force_check", description="Force check for new hackathons (Admin only)")
+async def force_check(interaction: discord.Interaction):
+    """Force a check for new hackathons"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You need administrator permissions to use this command!", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild_id)
+    
+    # Show current tracking state
+    current_tracked = previous_hackathons.get(guild_id, set())
+    await interaction.response.send_message(
+        f"Currently tracking {len(current_tracked)} hackathons.\n"
+        "Forcing check now...",
+        ephemeral=True
+    )
+    
+    # Force a check
+    await check_hackathons()
+    
+    # Show new tracking state
+    new_tracked = previous_hackathons.get(guild_id, set())
+    await interaction.followup.send(
+        f"Check complete!\n"
+        f"Now tracking {len(new_tracked)} hackathons.\n"
+        f"Tracked hackathons: {', '.join(sorted(new_tracked)) if new_tracked else 'None'}",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="debug_tracking", description="Show current hackathon tracking state (Admin only)")
+async def debug_tracking(interaction: discord.Interaction):
+    """Show current hackathon tracking state"""
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You need administrator permissions to use this command!", ephemeral=True)
+        return
+
+    guild_id = str(interaction.guild_id)
+    tracked_hackathons = previous_hackathons.get(guild_id, set())
+    
+    embed = discord.Embed(title="Hackathon Tracking Debug Info", color=0x00ff00)
+    embed.add_field(
+        name="Currently Tracked Hackathons", 
+        value='\n'.join(sorted(tracked_hackathons)) if tracked_hackathons else "None",
+        inline=False
+    )
+    
+    # Get current hackathons from sheet
+    guild_config = bot.guild_config.get_guild_config(guild_id)
+    if 'spreadsheet_id' in guild_config:
+        tracker = HackathonTracker(guild_config['spreadsheet_id'])
+        current_hackathons = tracker.get_hackathons()
+        current_names = {h[0] for h in current_hackathons if h and len(h) > 0}
+        
+        embed.add_field(
+            name="Current Hackathons in Sheet",
+            value='\n'.join(sorted(current_names)) if current_names else "None",
+            inline=False
+        )
+        
+        # Show differences
+        new_hackathons = current_names - tracked_hackathons
+        if new_hackathons:
+            embed.add_field(
+                name="New Untracked Hackathons",
+                value='\n'.join(sorted(new_hackathons)),
+                inline=False
+            )
+    
+    embed.set_footer(text=f"Guild ID: {guild_id}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # Run the bot
